@@ -1,0 +1,429 @@
+use crate::Result;
+use crate::hex_to_id;
+use crate::util::fixture_odb;
+
+fn odb() -> Result<gix_odb::Handle> {
+    fixture_odb("make_traversal_repo_for_trees.sh")
+}
+
+mod depthfirst {
+    use gix_object::FindExt;
+    use gix_testtools::normalize_debug_snapshot;
+    use gix_traverse::{tree, tree::recorder::Location};
+
+    use super::*;
+    use crate::util::fixture_odb;
+
+    #[test]
+    fn full_path_and_filename() -> gix_testtools::TestResult {
+        let db = odb()?;
+        let mut state = gix_traverse::tree::depthfirst::State::default();
+        let mut buf = state.pop_buf();
+        let mut recorder = tree::Recorder::default();
+        let tree = db
+            .find_commit(&hex_to_id("85df34aa34848b8138b2b3dcff5fb5c2b734e0ce"), &mut buf)?
+            .tree();
+
+        gix_traverse::tree::depthfirst(tree, &mut state, &db, &mut recorder)?;
+        insta::assert_snapshot!(
+            normalize_debug_snapshot(&recorder.records).0,
+            @r#"
+        [
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "a",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "b",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "c",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "d",
+                oid: Oid(2),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "d/a",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "e",
+                oid: Oid(3),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "e/b",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "f",
+                oid: Oid(4),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/c",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "f/d",
+                oid: Oid(5),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/d/x",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/z",
+                oid: Oid(1),
+            },
+        ]
+        "#
+        );
+
+        recorder.records.clear();
+        recorder = recorder.track_location(Some(Location::FileName));
+        gix_traverse::tree::depthfirst(tree, state, &db, &mut recorder)?;
+        insta::assert_snapshot!(
+            normalize_debug_snapshot(&recorder.records).0,
+            @r#"
+        [
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "a",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "b",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "c",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "d",
+                oid: Oid(2),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "a",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "e",
+                oid: Oid(3),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "b",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "f",
+                oid: Oid(4),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "c",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o40000),
+                filepath: "d",
+                oid: Oid(5),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "x",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "z",
+                oid: Oid(1),
+            },
+        ]
+        "#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn more_difficult_fixture() -> gix_testtools::TestResult {
+        let db = fixture_odb("make_traversal_repo_for_trees_depthfirst.sh")?;
+        let mut state = gix_traverse::tree::depthfirst::State::default();
+        let mut buf = state.pop_buf();
+        let mut recorder = tree::Recorder::default();
+        let tree = db
+            .find_commit(&hex_to_id("fe63a8a9fb7c27c089835aae92cbda675523803a"), &mut buf)?
+            .tree();
+
+        gix_traverse::tree::depthfirst(tree, &mut state, &db, &mut recorder)?;
+        let blobs = recorder
+            .records
+            .into_iter()
+            .filter(|e| e.mode.is_no_tree())
+            .collect::<Vec<_>>();
+        insta::assert_snapshot!(
+            normalize_debug_snapshot(&blobs).0,
+            @r#"
+        [
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "a",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "b",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "c",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "d/a",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "e/b",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/FUNDING.yml",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/ISSUE_TEMPLATE/x",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/c",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/dependabot.yml",
+                oid: Oid(1),
+            },
+            Entry {
+                mode: EntryMode(0o100644),
+                filepath: "f/z",
+                oid: Oid(1),
+            },
+        ]
+        "#
+        );
+        Ok(())
+    }
+}
+
+mod breadthfirst {
+    use gix_object::bstr::BString;
+    use gix_odb::pack::FindExt;
+    use gix_traverse::{tree, tree::recorder::Location};
+
+    use super::*;
+
+    #[test]
+    fn delegate_cancellation_is_classified() -> gix_testtools::TestResult {
+        struct Cancel;
+        impl tree::Visit for Cancel {
+            fn pop_back_tracked_path_and_set_current(&mut self) {}
+            fn pop_front_tracked_path_and_set_current(&mut self) {}
+            fn push_back_tracked_path_component(&mut self, _component: &gix_object::bstr::BStr) {}
+            fn push_path_component(&mut self, _component: &gix_object::bstr::BStr) {}
+            fn pop_path_component(&mut self) {}
+            fn visit_tree(&mut self, _entry: &gix_object::tree::EntryRef<'_>) -> tree::visit::Action {
+                std::ops::ControlFlow::Break(())
+            }
+            fn visit_nontree(&mut self, _entry: &gix_object::tree::EntryRef<'_>) -> tree::visit::Action {
+                std::ops::ControlFlow::Break(())
+            }
+        }
+
+        let object_hash = gix_testtools::object_hash();
+        let tree_data = [b"40000 entry\0".as_slice(), object_hash.empty_tree().as_bytes()].concat();
+        let blob_data = [b"100644 entry\0".as_slice(), object_hash.empty_blob().as_bytes()].concat();
+        for data in [tree_data, blob_data] {
+            let err = gix_traverse::tree::breadthfirst(
+                gix_object::TreeRefIter::from_bytes(&data, object_hash),
+                tree::breadthfirst::State::default(),
+                gix_object::find::Never,
+                &mut Cancel,
+            )
+            .expect_err("the delegate cancels for both tree and non-tree entries");
+            assert!(err.is_cancelled(), "the delegate requested cancellation");
+            assert!(
+                !err.is_retryable() && !err.can_retry(),
+                "cancellation stops rather than retries"
+            );
+            assert_eq!(
+                err.to_string(),
+                "The delegate cancelled the operation",
+                "classification preserves the diagnostic"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_path() -> gix_testtools::TestResult {
+        let db = odb()?;
+        let mut buf = Vec::new();
+        let mut buf2 = Vec::new();
+        let mut commit = db
+            .find_commit_iter(&hex_to_id("85df34aa34848b8138b2b3dcff5fb5c2b734e0ce"), &mut buf)?
+            .0;
+        // Full paths - that's the default.
+        let mut recorder = tree::Recorder::default();
+        gix_traverse::tree::breadthfirst(
+            db.find_tree_iter(&commit.tree_id()?, &mut buf2)?.0,
+            tree::breadthfirst::State::default(),
+            &db,
+            &mut recorder,
+        )?;
+
+        use gix_object::tree::EntryKind::*;
+        use gix_traverse::tree::recorder::Entry;
+        assert_eq!(
+            recorder.records,
+            vec![
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "a".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                },
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "b".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                },
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "c".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                },
+                Entry {
+                    mode: Tree.into(),
+                    filepath: "d".into(),
+                    oid: hex_to_id("496d6428b9cf92981dc9495211e6e1120fb6f2ba")
+                },
+                Entry {
+                    mode: Tree.into(),
+                    filepath: "e".into(),
+                    oid: hex_to_id("4277b6e69d25e5efa77c455340557b384a4c018a")
+                },
+                Entry {
+                    mode: Tree.into(),
+                    filepath: "f".into(),
+                    oid: hex_to_id("70fb16fc77b03e16acb4a5b1a6caf79ba302919a")
+                },
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "d/a".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                },
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "e/b".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                },
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "f/c".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                },
+                Entry {
+                    mode: Tree.into(),
+                    filepath: "f/d".into(),
+                    oid: hex_to_id("5805b676e247eb9a8046ad0c4d249cd2fb2513df")
+                },
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "f/z".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                },
+                Entry {
+                    mode: Blob.into(),
+                    filepath: "f/d/x".into(),
+                    oid: hex_to_id("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+                }
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn filename_only() -> gix_testtools::TestResult {
+        let db = odb()?;
+        let mut buf = Vec::new();
+        let mut buf2 = Vec::new();
+        let mut commit = db
+            .find_commit_iter(&hex_to_id("85df34aa34848b8138b2b3dcff5fb5c2b734e0ce"), &mut buf)?
+            .0;
+        let mut recorder = tree::Recorder::default().track_location(Some(Location::FileName));
+        gix_traverse::tree::breadthfirst(
+            db.find_tree_iter(&commit.tree_id()?, &mut buf2)?.0,
+            tree::breadthfirst::State::default(),
+            &db,
+            &mut recorder,
+        )?;
+
+        assert_eq!(
+            recorder.records.into_iter().map(|e| e.filepath).collect::<Vec<_>>(),
+            ["a", "b", "c", "d", "e", "f", "a", "b", "c", "d", "z", "x"]
+                .into_iter()
+                .map(BString::from)
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_location() -> gix_testtools::TestResult {
+        let db = odb()?;
+        let mut buf = Vec::new();
+        let mut buf2 = Vec::new();
+        let mut commit = db
+            .find_commit_iter(&hex_to_id("85df34aa34848b8138b2b3dcff5fb5c2b734e0ce"), &mut buf)?
+            .0;
+        let mut recorder = tree::Recorder::default().track_location(None);
+        gix_traverse::tree::breadthfirst(
+            db.find_tree_iter(&commit.tree_id()?, &mut buf2)?.0,
+            tree::breadthfirst::State::default(),
+            &db,
+            &mut recorder,
+        )?;
+
+        for path in recorder.records.into_iter().map(|e| e.filepath) {
+            assert_eq!(path, "", "path should be empty as it's not tracked at all");
+        }
+        Ok(())
+    }
+}

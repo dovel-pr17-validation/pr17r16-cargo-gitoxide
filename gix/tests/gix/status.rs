@@ -1,0 +1,712 @@
+use crate::Result;
+pub fn submodule_repo(name: &str) -> Result<gix::Repository> {
+    use crate::util::named_subrepo_opts;
+    Ok(named_subrepo_opts(
+        "make_submodules.sh",
+        name,
+        gix::open::Options::isolated(),
+    )?)
+}
+
+pub fn repo(name: &str) -> Result<gix::Repository> {
+    use crate::util::named_subrepo_opts;
+    Ok(named_subrepo_opts(
+        "make_status_repos.sh",
+        name,
+        gix::open::Options::isolated(),
+    )?)
+}
+
+mod into_iter {
+    use gix::status::{Item, Submodule, tree_index::TrackRenames};
+    use gix_diff::Rewrites;
+    use gix_testtools::TestResult;
+    use gix_testtools::size_ok;
+
+    use crate::status::{repo, submodule_repo};
+
+    #[test]
+    fn item_size() {
+        let actual = std::mem::size_of::<Item>();
+        let sha1 = 280;
+        let sha256_extra = 56;
+        let expected = sha1 + sha256_extra;
+        assert!(
+            size_ok(actual, expected),
+            "The size is the same as the one for the index-worktree-item: {actual} <~ {expected}"
+        );
+    }
+
+    #[test]
+    fn submodule_tree_index_modification() -> TestResult {
+        let repo = submodule_repo("git-mv-and-untracked-and-submodule-head-changed-and-modified")?;
+        let mut status = repo
+            .status(gix::progress::Discard)?
+            .index_worktree_options_mut(|opts| {
+                opts.sorting =
+                    Some(gix::status::plumbing::index_as_worktree_with_renames::Sorting::ByPathCaseSensitive);
+            })
+            .tree_index_track_renames(TrackRenames::Given(Rewrites {
+                track_empty: true,
+                ..Default::default()
+            }))
+            .into_iter(None)?;
+        let mut items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        items.sort_by(|a, b| a.location().cmp(b.location()));
+        assert_eq!(items.len(), 3, "1 untracked, 1 move, 1 submodule modification");
+        let snapshot = gix_testtools::normalize_debug_snapshot(&&items[1..]).0;
+        insta::assert_snapshot!(snapshot, @r#"
+        [
+            TreeIndex(
+                Rewrite {
+                    source_location: "this",
+                    source_index: 2,
+                    source_entry_mode: Mode(
+                        FILE,
+                    ),
+                    source_id: Oid(1),
+                    location: "that",
+                    index: 2,
+                    entry_mode: Mode(
+                        FILE,
+                    ),
+                    id: Oid(1),
+                    copy: false,
+                },
+            ),
+            IndexWorktree(
+                DirectoryContents {
+                    entry: Entry {
+                        rela_path: "untracked",
+                        status: Untracked,
+                        property: None,
+                        disk_kind: Some(
+                            File,
+                        ),
+                        index_kind: None,
+                        pathspec_match: Some(
+                            Always,
+                        ),
+                    },
+                    collapsed_directory_status: None,
+                },
+            ),
+        ]
+        "#);
+        Ok(())
+    }
+
+    #[test]
+    fn submodule_fully_ignored_by_override() -> TestResult {
+        let repo = submodule_repo("git-mv-and-untracked-and-submodule-head-changed-and-modified")?;
+        let mut status = repo
+            .status(gix::progress::Discard)?
+            .index_worktree_options_mut(|opts| {
+                opts.sorting =
+                    Some(gix::status::plumbing::index_as_worktree_with_renames::Sorting::ByPathCaseSensitive);
+            })
+            .tree_index_track_renames(TrackRenames::Given(Rewrites {
+                track_empty: true,
+                ..Default::default()
+            }))
+            .index_worktree_submodules(Some(Submodule::Given {
+                ignore: gix::submodule::config::Ignore::All,
+                check_dirty: false,
+            }))
+            .into_iter(None)?;
+        let mut items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        items.sort_by(|a, b| a.location().cmp(b.location()));
+        assert_eq!(
+            items.len(),
+            2,
+            "1 untracked, 1 move, 0 submodule modification (ignored)"
+        );
+        let snapshot = gix_testtools::normalize_debug_snapshot(&items).0;
+        insta::assert_snapshot!(snapshot, @r#"
+        [
+            TreeIndex(
+                Rewrite {
+                    source_location: "this",
+                    source_index: 2,
+                    source_entry_mode: Mode(
+                        FILE,
+                    ),
+                    source_id: Oid(1),
+                    location: "that",
+                    index: 2,
+                    entry_mode: Mode(
+                        FILE,
+                    ),
+                    id: Oid(1),
+                    copy: false,
+                },
+            ),
+            IndexWorktree(
+                DirectoryContents {
+                    entry: Entry {
+                        rela_path: "untracked",
+                        status: Untracked,
+                        property: None,
+                        disk_kind: Some(
+                            File,
+                        ),
+                        index_kind: None,
+                        pathspec_match: Some(
+                            Always,
+                        ),
+                    },
+                    collapsed_directory_status: None,
+                },
+            ),
+        ]
+        "#);
+        Ok(())
+    }
+    #[test]
+    fn submodule_fully_ignored_by_configuration() -> TestResult {
+        let repo = submodule_repo("git-mv-and-untracked-and-submodule-head-changed-and-modified-ignore-all")?;
+        let mut status = repo
+            .status(gix::progress::Discard)?
+            .index_worktree_options_mut(|opts| {
+                opts.sorting =
+                    Some(gix::status::plumbing::index_as_worktree_with_renames::Sorting::ByPathCaseSensitive);
+            })
+            .tree_index_track_renames(TrackRenames::Given(Rewrites {
+                track_empty: true,
+                ..Default::default()
+            }))
+            .into_iter(None)?;
+        let mut items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        items.sort_by(|a, b| a.location().cmp(b.location()));
+        assert_eq!(items.len(), 1, "1 untracked, 0 submodule modification (ignored)");
+        insta::assert_debug_snapshot!(&items, @r#"
+        [
+            IndexWorktree(
+                DirectoryContents {
+                    entry: Entry {
+                        rela_path: "untracked",
+                        status: Untracked,
+                        property: None,
+                        disk_kind: Some(
+                            File,
+                        ),
+                        index_kind: None,
+                        pathspec_match: Some(
+                            Always,
+                        ),
+                    },
+                    collapsed_directory_status: None,
+                },
+            ),
+        ]
+        "#);
+        Ok(())
+    }
+
+    #[test]
+    fn tree_index_modification_worktree_modification_racy_git() -> TestResult {
+        let repo = repo("racy-git")?;
+        let mut status = repo.status(gix::progress::Discard)?.into_iter(None)?;
+        let mut items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        items.sort_by(|a, b| a.location().cmp(b.location()));
+        assert_eq!(items.len(), 2, "1 modified in index, the same in worktree");
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_unborn() -> TestResult {
+        let repo = repo("untracked-unborn")?;
+        let mut status = repo.status(gix::progress::Discard)?.into_iter(None)?;
+        let mut items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        items.sort_by(|a, b| a.location().cmp(b.location()));
+        insta::assert_debug_snapshot!(items, @r#"
+        [
+            IndexWorktree(
+                DirectoryContents {
+                    entry: Entry {
+                        rela_path: "untracked",
+                        status: Untracked,
+                        property: None,
+                        disk_kind: Some(
+                            File,
+                        ),
+                        index_kind: None,
+                        pathspec_match: Some(
+                            Always,
+                        ),
+                    },
+                    collapsed_directory_status: None,
+                },
+            ),
+        ]
+        "#);
+        Ok(())
+    }
+
+    #[test]
+    fn added_unborn() -> TestResult {
+        let repo = repo("added-unborn")?;
+        let mut status = repo.status(gix::progress::Discard)?.into_iter(None)?;
+        let mut items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        items.sort_by(|a, b| a.location().cmp(b.location()));
+        let snapshot = gix_testtools::normalize_debug_snapshot(&items).0;
+        insta::assert_snapshot!(snapshot, @r#"
+        [
+            TreeIndex(
+                Addition {
+                    location: "added",
+                    index: 0,
+                    entry_mode: Mode(
+                        FILE,
+                    ),
+                    id: Oid(1),
+                },
+            ),
+            TreeIndex(
+                Addition {
+                    location: "dir/nested",
+                    index: 1,
+                    entry_mode: Mode(
+                        FILE,
+                    ),
+                    id: Oid(1),
+                },
+            ),
+        ]
+        "#);
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_added() -> TestResult {
+        let repo = repo("untracked-added")?;
+        let mut status = repo.status(gix::progress::Discard)?.into_iter(None)?;
+        let mut items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        items.sort_by(|a, b| a.location().cmp(b.location()));
+        let snapshot = gix_testtools::normalize_debug_snapshot(&items).0;
+        insta::assert_snapshot!(snapshot, @r#"
+        [
+            TreeIndex(
+                Addition {
+                    location: "added",
+                    index: 0,
+                    entry_mode: Mode(
+                        FILE,
+                    ),
+                    id: Oid(1),
+                },
+            ),
+        ]
+        "#);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn submodule_assume_unchanged_replaced_with_symlink_is_ignored() -> TestResult {
+        let repo = repo("submodule-assume-unchanged-symlink")?;
+        let mut status = repo.status(gix::progress::Discard)?.into_iter(None)?;
+        let items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+        assert!(
+            items.is_empty(),
+            "assume-unchanged submodule should not show up in status"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninitialized_submodule_with_files_is_clean() -> TestResult {
+        let root = gix_testtools::scripted_fixture_read_only("make_uninitialized_submodule.sh")?.join("uninitialized");
+        assert_eq!(
+            gix_testtools::git(&root, "--no-optional-locks status --porcelain=v1 --untracked-files=all")?,
+            "",
+            "Git ignores files in an uninitialized submodule"
+        );
+
+        let repo = gix::open_opts(root, gix::open::Options::isolated())?;
+        for untracked in [
+            gix::status::UntrackedFiles::Collapsed,
+            gix::status::UntrackedFiles::Files,
+        ] {
+            let items = repo
+                .status(gix::progress::Discard)?
+                .untracked_files(untracked)
+                .into_iter(None)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            assert!(
+                items.is_empty(),
+                "an uninitialized submodule must stay clean: {items:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "Needs Git's macOS Unicode precomposition")]
+    fn emoji_with_decomposed_unicode_matches_git() -> TestResult {
+        let root = gix_testtools::scripted_fixture_read_only_needs_archive("make_emoji_with_decomposed_unicode.sh")?;
+        assert_eq!(
+            gix_testtools::git(&root, "--no-optional-locks status --porcelain=v1 --untracked-files=all")?,
+            "",
+            "the filenames from the report are tracked and clean in Git"
+        );
+
+        let repo = gix::open_opts(root, gix::open::Options::isolated())?;
+        let items = repo
+            .status(gix::progress::Discard)?
+            .into_iter(None)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(
+            items.is_empty(),
+            "Unicode precomposition must agree with Git: {items:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn error_during_tree_traversal_causes_failure() -> TestResult {
+        let mut error_snapshots = Vec::new();
+        let repo = repo("untracked-only")?;
+        let invalid_tree_id = repo.object_hash().empty_blob();
+        let platform = repo.status(gix::progress::Discard)?.head_tree(invalid_tree_id);
+        if cfg!(feature = "parallel") {
+            let mut items: Vec<_> = platform.into_iter(None)?.collect();
+            assert_eq!(
+                items.len(),
+                3,
+                "2 untracked and one error, which is detected only in the end."
+            );
+            error_snapshots.push(gix_testtools::redact_debug_snapshot(
+                &(items.pop().expect("last item").unwrap_err()),
+                &[],
+            ));
+        } else {
+            match platform.into_iter(None) {
+                Ok(_) => {
+                    unreachable!("errors would be detected early here as everything is done ahead of time")
+                }
+                Err(err) => {
+                    error_snapshots.push(gix_testtools::redact_debug_snapshot(&(err), &[]));
+                }
+            }
+        }
+        insta::assert_debug_snapshot!(error_snapshots, "error during tree traversal causes failure", @"
+        [
+            Could not create index from tree at Oid(1)
+            
+            Caused by:
+                0: Expected object of kind tree but got blob at Oid(1),
+        ]
+        ");
+        Ok(())
+    }
+}
+
+mod index_worktree {
+    mod iter {
+        use gix::status::index_worktree::Item;
+        use gix_testtools::TestResult;
+        use gix_testtools::size_ok;
+        use pretty_assertions::assert_eq;
+
+        use crate::status::{repo, submodule_repo};
+
+        #[test]
+        #[cfg(unix)]
+        fn status_reads_only_required_attribute_and_ignore_files() -> TestResult {
+            fn assert_symlink(path: &std::path::Path) -> TestResult {
+                assert!(
+                    path.symlink_metadata()?.file_type().is_symlink(),
+                    "{} must be an unreadable symlink loop",
+                    path.display()
+                );
+                Ok(())
+            }
+
+            let fixture = gix_testtools::scripted_fixture_read_only("make_status_attribute_and_ignore_repos.sh")?;
+            if !gix_testtools::fixture_has_symlinks(&fixture)? {
+                return Ok(());
+            }
+            let tracked_root = fixture.join("tracked");
+            assert_symlink(&tracked_root.join(".gitignore"))?;
+            let tracked = gix::open_opts(tracked_root, gix::open::Options::isolated())?;
+            for (pattern, expected_count) in [("file", 1), (":(attr:visible)*", 1), (":(attr:missing)*", 0)] {
+                let items = tracked
+                    .status(gix::progress::Discard)?
+                    .untracked_files(gix::status::UntrackedFiles::None)
+                    .into_index_worktree_iter([pattern.into()])?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(
+                    items.len(),
+                    expected_count,
+                    "tracked status needs attributes for pathspecs and filters, but never ignores: {pattern}"
+                );
+                if let Some(item) = items.first() {
+                    assert_eq!(item.rela_path(), "file", "the changed tracked file is selected");
+                    assert_eq!(
+                        item.summary(),
+                        Some(gix::status::index_worktree::iter::Summary::Modified),
+                        "the equal-sized content change is detected"
+                    );
+                }
+            }
+
+            let untracked_root = fixture.join("untracked");
+            assert_symlink(&untracked_root.join(".gitattributes"))?;
+            let untracked = gix::open_opts(untracked_root, gix::open::Options::isolated())?;
+            let items = untracked
+                .status(gix::progress::Discard)?
+                .into_index_worktree_iter(None)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            assert_eq!(
+                items.len(),
+                1,
+                "untracked status applies ignores without reading attributes"
+            );
+            assert_eq!(items[0].rela_path(), "untracked", "only the unignored file is reported");
+            Ok(())
+        }
+
+        #[test]
+        fn item_size() {
+            let actual = std::mem::size_of::<Item>();
+            let sha1 = 280;
+            let sha256_extra = 56;
+            let expected = sha1 + sha256_extra;
+            assert!(
+                size_ok(actual, expected),
+                "The size is pretty huge and goes down ideally: {actual} <~ {expected}"
+            );
+        }
+
+        #[test]
+        fn submodule_modification() -> TestResult {
+            let repo = submodule_repo("modified-untracked-and-submodule-head-changed-and-modified")?;
+            let mut status = repo
+                .status(gix::progress::Discard)?
+                .index_worktree_options_mut(|opts| {
+                    opts.sorting =
+                        Some(gix::status::plumbing::index_as_worktree_with_renames::Sorting::ByPathCaseSensitive);
+                })
+                .into_index_worktree_iter(None)?;
+            let items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+            assert_eq!(items.len(), 3, "1 untracked, 1 modified file, 1 submodule modification");
+            Ok(())
+        }
+
+        #[test]
+        fn untracked_files_collapse_by_default() -> TestResult {
+            let repo = repo("untracked-only")?;
+            let status = repo
+                .status(gix::progress::Discard)?
+                .index_worktree_options_mut(|opts| {
+                    opts.sorting =
+                        Some(gix::status::plumbing::index_as_worktree_with_renames::Sorting::ByPathCaseSensitive);
+                })
+                .into_index_worktree_iter(None)?;
+            let items: Vec<_> = status.filter_map(std::result::Result::ok).collect();
+            assert_eq!(
+                items,
+                [
+                    Item::DirectoryContents {
+                        entry: gix_dir::Entry {
+                            rela_path: "new".into(),
+                            status: gix_dir::entry::Status::Untracked,
+                            property: None,
+                            disk_kind: Some(gix_dir::entry::Kind::Directory),
+                            index_kind: None,
+                            pathspec_match: Some(gix_dir::entry::PathspecMatch::Always),
+                        },
+                        collapsed_directory_status: None
+                    },
+                    Item::DirectoryContents {
+                        entry: gix_dir::Entry {
+                            rela_path: "subdir/untracked".into(),
+                            status: gix_dir::entry::Status::Untracked,
+                            property: None,
+                            disk_kind: Some(gix_dir::entry::Kind::File),
+                            index_kind: None,
+                            pathspec_match: Some(gix_dir::entry::PathspecMatch::Always),
+                        },
+                        collapsed_directory_status: None
+                    }
+                ],
+                "'new/untracked' gets collapsed, but the second untracked is in a folder with a tracked file.\
+                This collapsing behaviour is the default."
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn untracked_files_settings_none() -> TestResult {
+            let mut repo = repo("untracked-only")?;
+            repo.config_snapshot_mut()
+                .set_value(&gix::config::tree::Status::SHOW_UNTRACKED_FILES, "no")?;
+
+            let mut status = repo
+                .status(gix::progress::Discard)?
+                .index_worktree_options_mut(|opts| {
+                    opts.sorting =
+                        Some(gix::status::plumbing::index_as_worktree_with_renames::Sorting::ByPathCaseSensitive);
+                })
+                .into_index_worktree_iter(None)?;
+            let items: Vec<_> = status.by_ref().filter_map(std::result::Result::ok).collect();
+            assert_eq!(items, [], "no untracked files are found…");
+            assert_eq!(
+                status.outcome_mut().expect("iteration done").index_worktree.dirwalk,
+                None,
+                "…as there was no directory walk"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn early_drop_for_is_dirty_emulation() -> TestResult {
+            let repo = submodule_repo("modified-untracked-and-submodule-head-changed-and-modified")?;
+            let is_dirty = repo
+                .status(gix::progress::Discard)?
+                .index_worktree_submodules(gix::status::Submodule::AsConfigured { check_dirty: true })
+                .index_worktree_options_mut(|opts| {
+                    opts.sorting =
+                        Some(gix::status::plumbing::index_as_worktree_with_renames::Sorting::ByPathCaseSensitive);
+                })
+                .into_index_worktree_iter(None)?
+                .next()
+                .is_some();
+            assert!(is_dirty, "this should abort the work as quickly as possible");
+            Ok(())
+        }
+
+        #[test]
+        #[cfg(unix)] // symlinks are used here, let's not try our luck on Windows.
+        fn tracked_entries_under_a_symlinked_directory_are_reported_as_removed() -> TestResult {
+            let repo = repo("symlink-replaces-tracked-dir")?;
+            let mut items: Vec<_> = repo
+                .status(gix::progress::Discard)?
+                .into_index_worktree_iter(None)?
+                .collect::<std::result::Result<_, _>>()?;
+            items.sort_by(|a, b| a.rela_path().cmp(b.rela_path()));
+            let idx = 2;
+            assert_eq!(items[idx].rela_path(), "tracked/file");
+            assert_eq!(
+                items[idx].summary(),
+                Some(gix::status::index_worktree::iter::Summary::Removed)
+            );
+            // Remove the entry with stat information which can't be stable.
+            items.remove(idx);
+            // We correctly identify the `tracked` folder as tracked, knowing that in the index
+            // it's a directory, and locally it's a symlink.
+            insta::assert_debug_snapshot!(&items, @r#"
+            [
+                DirectoryContents {
+                    entry: Entry {
+                        rela_path: "target",
+                        status: Untracked,
+                        property: None,
+                        disk_kind: Some(
+                            Directory,
+                        ),
+                        index_kind: None,
+                        pathspec_match: Some(
+                            Always,
+                        ),
+                    },
+                    collapsed_directory_status: None,
+                },
+                DirectoryContents {
+                    entry: Entry {
+                        rela_path: "tracked",
+                        status: Untracked,
+                        property: None,
+                        disk_kind: Some(
+                            Symlink,
+                        ),
+                        index_kind: Some(
+                            Directory,
+                        ),
+                        pathspec_match: Some(
+                            Always,
+                        ),
+                    },
+                    collapsed_directory_status: None,
+                },
+            ]
+            "#);
+            Ok(())
+        }
+    }
+}
+
+mod is_dirty {
+    use crate::status::{repo, submodule_repo};
+    use gix_testtools::TestResult;
+
+    #[test]
+    fn various_changes_positive() -> TestResult {
+        let repo = submodule_repo("modified-untracked-and-submodule-head-changed-and-modified")?;
+        assert!(repo.is_dirty()?, "The repository has various changes");
+        Ok(())
+    }
+
+    #[test]
+    fn submodule_changes_are_picked_up() -> TestResult {
+        let repo = submodule_repo("submodule-head-changed")?;
+        assert!(repo.is_dirty()?, "head-changes are also discovered");
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_files_are_excluded() -> TestResult {
+        let repo = submodule_repo("module1")?;
+        assert_eq!(
+            repo.status(gix::progress::Discard)?
+                .into_index_worktree_iter(None)?
+                .count(),
+            1,
+            "there is one untracked file"
+        );
+        assert!(
+            !repo.is_dirty()?,
+            "untracked files aren't taken into consideration, just like `git describe` which ignores them"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unborn_head_is_not_an_error() -> TestResult {
+        let repo = repo("untracked-unborn")?;
+
+        assert!(
+            !repo.is_dirty()?,
+            "untracked files aren't taken into consideration, even if HEAD is unborn"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn added_files_in_unborn_head_are_dirty() -> TestResult {
+        let repo = repo("added-unborn")?;
+
+        assert!(
+            repo.is_dirty()?,
+            "files added to the index make an unborn repository dirty"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn index_changed() -> TestResult {
+        let repo = repo("git-mv")?;
+        assert!(
+            repo.is_dirty()?,
+            "the only detectable change is in the index, in comparison to the HEAD^{{tree}}"
+        );
+
+        let repo = submodule_repo("with-submodules")?;
+        assert!(
+            repo.is_dirty()?,
+            "the index changed here as well, this time there is also a new file"
+        );
+        Ok(())
+    }
+}

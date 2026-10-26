@@ -1,0 +1,236 @@
+use gix_testtools::TestResult;
+use std::path::Path;
+
+use bstr::{ByteSlice, ByteVec};
+use gix_filter::{eol, eol::AttributesDigest};
+
+#[test]
+fn with_binary_attribute_is_never_converted() -> TestResult {
+    let mut buf = Vec::new();
+    let changed = eol::convert_to_git(
+        b"hi\r\nho",
+        AttributesDigest::Binary,
+        &mut buf,
+        &mut no_call,
+        Default::default(),
+    )?;
+    assert!(!changed, "the user marked it as binary so it's never being touched");
+    Ok(())
+}
+
+#[test]
+fn no_crlf_means_no_work() -> TestResult {
+    let mut buf = Vec::new();
+    let changed = eol::convert_to_git(
+        b"hi",
+        AttributesDigest::TextCrlf,
+        &mut buf,
+        &mut no_call,
+        Default::default(),
+    )?;
+    assert!(!changed);
+
+    let changed = eol::convert_to_git(
+        b"hi",
+        AttributesDigest::TextAutoCrlf,
+        &mut buf,
+        &mut no_call,
+        Default::default(),
+    )?;
+    assert!(
+        !changed,
+        "in auto-mode, the index is only queried if there is a CRLF it could prevent from being converted"
+    );
+    Ok(())
+}
+
+#[test]
+fn detected_as_binary() -> TestResult {
+    let mut buf = Vec::new();
+    let changed = eol::convert_to_git(
+        b"hi\0zero makes it binary",
+        AttributesDigest::TextAuto,
+        &mut buf,
+        &mut no_call,
+        Default::default(),
+    )?;
+    assert!(
+        !changed,
+        "in auto-mode, we have a heuristic to see if the buffer is binary"
+    );
+    Ok(())
+}
+
+#[test]
+fn trailing_dos_eof_marker_is_not_detected_as_binary() -> TestResult {
+    let mut buf = Vec::new();
+    let changed = eol::convert_to_git(
+        b"a\r\nb\r\n\x1a",
+        AttributesDigest::TextAuto,
+        &mut buf,
+        &mut no_object_in_index,
+        Default::default(),
+    )?;
+    assert!(changed, "the DOS EOF marker doesn't stand in the way of conversion");
+    assert_eq!(buf.as_bstr(), "a\nb\n\x1a");
+
+    let changed = eol::convert_to_git(
+        b"a\r\nb\r\n\x1a\x1a",
+        AttributesDigest::TextAuto,
+        &mut buf,
+        &mut no_object_in_index,
+        Default::default(),
+    )?;
+    assert!(!changed, "a second marker isn't discounted, so this is binary");
+    Ok(())
+}
+
+#[test]
+fn fast_conversion_by_stripping_cr() -> TestResult {
+    let mut buf = Vec::new();
+    let changed = eol::convert_to_git(
+        b"a\r\nb\r\nc",
+        AttributesDigest::TextCrlf,
+        &mut buf,
+        &mut no_call,
+        Default::default(),
+    )?;
+    assert!(changed);
+    assert_eq!(buf.as_bstr(), "a\nb\nc", "here carriage returns can just be stripped");
+    Ok(())
+}
+
+#[test]
+fn slower_conversion_due_to_lone_cr() -> TestResult {
+    let mut buf = Vec::new();
+    let changed = eol::convert_to_git(
+        b"\r\ra\r\nb\r\nc",
+        AttributesDigest::TextCrlf,
+        &mut buf,
+        &mut no_call,
+        Default::default(),
+    )?;
+    assert!(changed);
+    assert_eq!(
+        buf.as_bstr(),
+        "\r\ra\nb\nc",
+        "here carriage returns cannot be stripped but must be handled in pairs"
+    );
+    Ok(())
+}
+
+#[test]
+fn crlf_in_index_prevents_conversion_to_lf() -> TestResult {
+    let mut buf = Vec::new();
+    let mut called = false;
+    let changed = eol::convert_to_git(
+        b"eligible\r\n",
+        AttributesDigest::TextAutoInput,
+        &mut buf,
+        &mut |buf| {
+            called = true;
+            buf.clear();
+            buf.push_str("with CRLF\r\n");
+            Ok(Some(()))
+        },
+        Default::default(),
+    )?;
+    assert!(called, "in auto mode, the index is queried as well");
+    assert!(
+        !changed,
+        "we saw the CRLF is present in the index, so it's unsafe to make changes"
+    );
+    Ok(())
+}
+
+#[test]
+fn round_trip_check() -> TestResult {
+    let mut error_snapshots = Vec::new();
+    let mut buf = Vec::new();
+    for (input, digest) in [
+        (&b"lone-nl\nhi\r\nho"[..], AttributesDigest::TextCrlf),
+        (&b"lone-cr\nhi\r\nho"[..], AttributesDigest::TextCrlf),
+        (&b"hi\r\nho"[..], AttributesDigest::TextInput),
+    ] {
+        let err = eol::convert_to_git(
+            input,
+            digest,
+            &mut buf,
+            &mut no_call,
+            eol::convert_to_git::Options {
+                round_trip_check: Some(gix_filter::eol::convert_to_git::RoundTripCheck::Fail {
+                    rela_path: Path::new("hello.txt"),
+                }),
+                config: Default::default(),
+            },
+        )
+        .expect_err("the configured line endings would not round-trip");
+        assert!(
+            err.is_validation(),
+            "the input violates the requested round-trip constraint"
+        );
+
+        error_snapshots.push(gix_testtools::redact_debug_snapshot(&(err), &[]));
+
+        let changed = eol::convert_to_git(
+            input,
+            digest,
+            &mut buf,
+            &mut no_call,
+            eol::convert_to_git::Options {
+                round_trip_check: Some(gix_filter::eol::convert_to_git::RoundTripCheck::Warn {
+                    rela_path: Path::new("hello.txt"),
+                }),
+                config: Default::default(),
+            },
+        )?;
+        assert!(
+            changed,
+            "in warn mode, we will get a result even though it won't round-trip"
+        );
+    }
+    insta::assert_debug_snapshot!(error_snapshots, "round trip check", @r#"
+    [
+        LF would be replaced by CRLF in "hello.txt",
+        LF would be replaced by CRLF in "hello.txt",
+        CRLF would be replaced by LF in "hello.txt",
+    ]
+    "#);
+    Ok(())
+}
+
+#[test]
+fn index_object_errors_keep_their_native_cause() -> TestResult {
+    use gix_error::ErrorExt;
+
+    let err = eol::convert_to_git(
+        b"text\r\n",
+        AttributesDigest::TextAuto,
+        &mut Vec::new(),
+        &mut |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound).raise()),
+        Default::default(),
+    )
+    .expect_err("the index lookup fails before conversion");
+    assert_eq!(
+        err.downcast_any_ref::<std::io::Error>()
+            .expect("the index lookup's native cause is retained")
+            .kind(),
+        std::io::ErrorKind::NotFound,
+        "conversion must not replace delegated errors"
+    );
+    assert!(err.is_not_found(), "the index lookup retains its classification");
+    assert!(
+        !err.is_validation(),
+        "an index lookup failure is not invalid filter input"
+    );
+    assert!(!err.is_corrupted(), "an index lookup failure is not malformed content");
+    Ok(())
+}
+
+fn no_call(_buf: &mut Vec<u8>) -> gix_error::Result<Option<()>> {
+    unreachable!("index function will not be called")
+}
+
+fn no_object_in_index(_buf: &mut Vec<u8>) -> gix_error::Result<Option<()>> {
+    Ok(None)
+}

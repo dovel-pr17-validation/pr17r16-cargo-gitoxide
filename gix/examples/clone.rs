@@ -1,0 +1,59 @@
+// Clone a repository from any URL or Path to a given target directory
+
+use gix::{
+    Result,
+    error::{OptionExt, ResultExt, message},
+};
+
+fn main() -> Result<()> {
+    let repo_url = std::env::args_os()
+        .nth(1)
+        .ok_or_raise(|| message("The first argument is the repository URL"))?;
+
+    let dst = std::env::args_os()
+        .nth(2)
+        .ok_or_raise(|| message("The second argument is the directory to clone the repository into"))?;
+
+    // SAFETY: The closure doesn't use mutexes or memory allocation, so it should be safe to call from a signal handler.
+    unsafe {
+        gix::interrupt::init_handler(1, || {})?;
+    }
+    std::fs::create_dir_all(&dst).or_error()?;
+    let repo_url = repo_url
+        .to_str()
+        .ok_or_raise(|| message("The repository URL must be valid UTF-8"))?;
+    let url = gix::url::parse(repo_url)?;
+
+    println!("Url: {:?}", url.to_bstring());
+    let mut prepare_clone = gix::prepare_clone(url, &dst)?;
+
+    println!("Cloning {} into {}...", repo_url, dst.display());
+    let (mut prepare_checkout, _) =
+        prepare_clone.fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+
+    println!(
+        "Checking out into {} ...",
+        prepare_checkout.repo().workdir().expect("should be there").display()
+    );
+
+    let (repo, _) = prepare_checkout.main_worktree(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+    println!(
+        "Repo cloned into {}",
+        repo.workdir().expect("directory pre-created").display()
+    );
+
+    let remote = repo
+        .find_default_remote(gix::remote::Direction::Fetch)
+        .expect("always present after clone")?;
+
+    println!(
+        "Default remote: {} -> {}",
+        remote.name().expect("default remote is always named").as_bstr(),
+        remote
+            .url(gix::remote::Direction::Fetch)
+            .expect("should be the remote URL")
+            .to_bstring(),
+    );
+
+    Ok(())
+}

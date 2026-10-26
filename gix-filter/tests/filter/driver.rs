@@ -1,0 +1,892 @@
+use bstr::{BStr, BString};
+
+mod baseline {
+    use crate::driver::driver_path;
+    use gix_testtools::TestResult;
+
+    #[test]
+    fn our_implementation_used_by_git() -> TestResult {
+        let exe = driver_path().to_string();
+        gix_testtools::scripted_fixture_read_only_with_args_single_archive("baseline.sh", [exe])?;
+        Ok(())
+    }
+}
+
+mod process {
+    use std::{
+        io::Write,
+        path::Path,
+        process::{Command, Stdio},
+    };
+
+    use gix_error::{Class, TestResult};
+    use gix_packetline::blocking_io::encode;
+
+    #[test]
+    fn client_handshake_failures_are_classified_by_meaning() -> TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        let temp = gix_testtools::tempfile::TempDir::new()?;
+        let greeting = Some("git-filter-server");
+        let version = Some("version=2");
+        let cases = [
+            (
+                &[Some("other-server"), None][..],
+                "Wanted 'git-filter-server, got  'other-server'",
+                Some(Class::Corruption),
+            ),
+            (
+                &[greeting, Some("other-version"), None],
+                "Needed 'version=<integer>', got  'other-version'",
+                Some(Class::Corruption),
+            ),
+            (
+                &[greeting, Some("version=two"), None],
+                "Needed 'version=<integer>', got  'version=two'",
+                Some(Class::Corruption),
+            ),
+            (
+                &[greeting, version, Some("unexpected"), None],
+                "expected flush packet, got 'version=2unexpected'",
+                Some(Class::Corruption),
+            ),
+            (
+                &[greeting, Some("version=3"), None],
+                "Server offered 3, we only support  '2'",
+                Some(Class::Corruption),
+            ),
+            (
+                &[greeting, version, None, Some("capability=other"), None],
+                "The server sent the 'other' capability which isn't among the ones we desire can support",
+                Some(Class::Corruption),
+            ),
+        ];
+        for (lines, expected, class) in cases {
+            let response = packet_lines(lines)?;
+            let child = helper_command(temp.path())
+                .args(["handshake-response", response.as_str()])
+                .spawn()?;
+            let err = gix_filter::driver::process::Client::handshake(child, "git-filter", &[2], &["clean"])
+                .err()
+                .expect("the peer response must fail the handshake");
+            assert_eq!(err.to_string(), expected, "the protocol diagnostic remains unchanged");
+            assert_eq!(
+                err.classify().map(|class| class.class()).collect::<Vec<_>>(),
+                class.iter().copied().collect::<Vec<_>>(),
+                "malformed responses and selecting an unadvertised version violate the protocol"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn server_failures_are_classified_by_meaning() -> TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        let temp = gix_testtools::tempfile::TempDir::new()?;
+        let greeting = Some("git-filter-client");
+        let handshake = packet_lines(&[greeting, Some("version=2"), None, None])?;
+        let cases = [
+            (
+                packet_lines(&[Some("other-client"), None])?,
+                "Expected 'git-filter-client, got 'other-client'",
+                "corruption",
+            ),
+            (
+                packet_lines(&[greeting, Some("version=two"), None])?,
+                "Expected 'version=<integer>', got 'version=two'",
+                "corruption",
+            ),
+            (
+                format!("{handshake}{}", packet_lines(&[Some("pathname=file"), None])?),
+                "Wanted 'command=<name>', got  'pathname=file'",
+                "corruption",
+            ),
+            (
+                format!(
+                    "{handshake}{}",
+                    packet_lines(&[Some("command=smudge"), Some("pathname"), None])?
+                ),
+                "Expected 'key=value' metadata, got 'pathname'",
+                "corruption",
+            ),
+            (
+                format!("{handshake}{}0001", packet_lines(&[Some("command=smudge")])?),
+                "expected data line, got  'Delimiter'",
+                "corruption",
+            ),
+            (
+                packet_lines(&[greeting, Some("version=3"), None])?,
+                "Could not select supported version from the one sent by the client: 3",
+                "unsupported",
+            ),
+        ];
+        for (input, expected, class) in cases {
+            let mut child = helper_command(temp.path())
+                .args(["assert-server-error", class])
+                .spawn()?;
+            child
+                .stdin
+                .take()
+                .expect("stdin is piped")
+                .write_all(input.as_bytes())?;
+            let output = child.wait_with_output()?;
+            assert!(
+                output.status.success(),
+                "the isolated server must verify its error classification: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::str::from_utf8(&output.stderr)?.trim_end(),
+                expected,
+                "the server diagnostic remains unchanged"
+            );
+        }
+        Ok(())
+    }
+
+    fn helper_command(dir: &Path) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gix-filter-test-arrow"));
+        gix_testtools::configure_git_environment(&mut cmd, dir)
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    }
+
+    fn packet_lines(lines: &[Option<&str>]) -> TestResult<String> {
+        let mut out = Vec::new();
+        for line in lines {
+            match line {
+                Some(line) => encode::data_to_write(line.as_bytes(), &mut out)?,
+                None => encode::flush_to_write(&mut out)?,
+            };
+        }
+        Ok(String::from_utf8(out)?)
+    }
+}
+
+mod shutdown {
+    use crate::Result;
+    use std::time::Duration;
+
+    use bstr::ByteVec;
+    use gix_filter::driver::{Operation, Process, shutdown::Mode};
+
+    use crate::driver::apply::driver_with_process;
+
+    pub(crate) fn extract_client(
+        res: Option<gix_filter::driver::Process<'_>>,
+    ) -> &mut gix_filter::driver::process::Client {
+        match res {
+            Some(Process::SingleFile { .. }) | None => {
+                unreachable!("process is configured")
+            }
+            Some(Process::MultiFile { client, .. }) => client,
+        }
+    }
+
+    fn state_with_waiting_process() -> Result<gix_filter::driver::State> {
+        let mut state = gix_filter::driver::State::default();
+        let driver = driver_with_process();
+        let client = extract_client(state.maybe_launch_process(&driver, Operation::Clean, "does not matter".into())?);
+
+        assert!(
+            client
+                .invoke("wait-1-s", &mut None.into_iter(), &mut &b""[..])?
+                .is_success(),
+            "this lets the process wait for a second using our hidden command"
+        );
+        Ok(state)
+    }
+
+    #[test]
+    fn explicit_shutdown_waits_for_processes() -> gix_testtools::TestResult {
+        let mut state = state_with_waiting_process()?;
+
+        let start = std::time::Instant::now();
+        let outcome = state.shutdown(Mode::WaitForProcesses)?.into_result()?;
+        assert_eq!(outcome.processes.len(), 1, "we only launch one process");
+        assert!(
+            start.elapsed() >= Duration::from_millis(500),
+            "explicit shutdown waits for the process to finish"
+        );
+
+        let driver = driver_with_process();
+        assert!(
+            state
+                .maybe_launch_process(&driver, Operation::Clean, "does not matter".into())?
+                .is_some(),
+            "the same state can launch a new process after shutdown"
+        );
+        assert_eq!(
+            state.shutdown(Mode::WaitForProcesses)?.into_result()?.processes.len(),
+            1,
+            "the newly launched process is tracked"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsuccessful_process_exit_can_be_turned_into_an_error() -> gix_testtools::TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let mut driver = driver_with_process();
+        driver
+            .process
+            .as_mut()
+            .expect("process driver is configured")
+            .push_str(" fail-on-shutdown");
+        assert!(
+            state
+                .maybe_launch_process(&driver, Operation::Clean, "does not matter".into())?
+                .is_some(),
+            "the process completes its handshake before failing during shutdown"
+        );
+
+        let outcome = state.shutdown(Mode::WaitForProcesses)?;
+        assert_eq!(outcome.processes.len(), 1, "we only launch one process");
+        assert!(
+            outcome.processes[0].1.is_some(),
+            "waiting records the process exit status"
+        );
+        let err = outcome.into_result().expect_err("the non-zero exit status is an error");
+        assert!(
+            err.classify().next().is_none(),
+            "a subprocess exit status does not identify corruption or invalid input"
+        );
+        insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[(env!("CARGO_BIN_EXE_gix-filter-test-arrow"), "<filter-driver>"), ("exit code:", "exit status:")]), "the failed command and status are retained", @r#"Filter process "\'<filter-driver>\' process fail-on-shutdown" failed, exit_code=1, exit_status="exit status: 1""#);
+        Ok(())
+    }
+
+    #[test]
+    fn drop_waits_for_processes() -> gix_testtools::TestResult {
+        let state = state_with_waiting_process()?;
+
+        let start = std::time::Instant::now();
+        drop(state);
+        assert!(
+            start.elapsed() >= Duration::from_millis(500),
+            "dropping state waits for the process to finish"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) mod apply {
+    use gix_testtools::TestResult;
+    use std::{io::Read, sync::LazyLock};
+
+    use crate::driver::{driver_path, shutdown::extract_client};
+    use bstr::{BStr, BString, ByteSlice, ByteVec};
+    use gix_filter::{
+        Driver, driver,
+        driver::{Operation, apply, apply::Delay},
+    };
+
+    fn driver_no_process() -> Driver {
+        let mut driver = driver_with_process();
+        driver.process = None;
+        driver
+    }
+
+    pub(crate) fn driver_with_process() -> Driver {
+        let command = |suffix| {
+            let mut command = driver_path();
+            command.push_str(suffix);
+            command
+        };
+        Driver {
+            name: "arrow".into(),
+            clean: Some(command(" clean %f")),
+            smudge: Some(command(" smudge %f")),
+            process: Some(command(" process")),
+            required: true,
+        }
+    }
+
+    #[test]
+    fn absolute_repository_context_survives_worktree_cwd() -> TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        let fixture = gix_testtools::scripted_fixture_read_only_with_args_single_archive(
+            "baseline.sh",
+            [driver_path().to_string()],
+        )?;
+        let worktree = gix_path::realpath(fixture.join("no-process"))?;
+        let elsewhere = gix_testtools::tempfile::TempDir::new()?;
+        let _cwd = gix_testtools::set_current_dir(elsewhere.path())?;
+        let mut state = driver::State::new(gix_command::Context {
+            git_dir: Some(worktree.join(".git")),
+            worktree_dir: Some(worktree),
+            ..Default::default()
+        });
+        let filter = Driver {
+            name: "context".into(),
+            clean: Some("cat >/dev/null && git rev-parse --is-inside-work-tree".into()),
+            smudge: None,
+            process: None,
+            required: true,
+        };
+        let mut output = String::new();
+        state
+            .apply(
+                &filter,
+                &mut std::io::empty(),
+                Operation::Clean,
+                context_from_path("file"),
+            )?
+            .expect("a clean filter is configured")
+            .read_to_string(&mut output)?;
+        assert_eq!(
+            output.trim(),
+            "true",
+            "Git must find the repository after the filter changes cwd"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_driver_means_no_filter_is_applied() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let mut driver = driver_no_process();
+        driver.smudge = None;
+        assert!(
+            state
+                .apply(
+                    &driver,
+                    &mut std::io::empty(),
+                    Operation::Smudge,
+                    context_from_path("ignored")
+                )?
+                .is_none()
+        );
+
+        driver.clean = None;
+        assert!(
+            state
+                .apply(
+                    &driver,
+                    &mut std::io::empty(),
+                    Operation::Clean,
+                    context_from_path("ignored")
+                )?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_crashing_process_can_restart_it() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let driver = driver_with_process();
+        let err = match state.apply(
+            &driver,
+            &mut std::io::empty(),
+            Operation::Smudge,
+            context_from_path("fail"),
+        ) {
+            Ok(_) => panic!("expecting an error as invalid context was passed"),
+            Err(err) => err,
+        };
+        assert!(
+            !err.is_corrupted() && !err.is_validation(),
+            "a process crash retains its native I/O meaning"
+        );
+        let io_err = err
+            .downcast_any_ref::<std::io::Error>()
+            .expect("the crashing process retains its pipe error");
+        assert!(
+            matches!(
+                io_err.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe
+            ),
+            "a process crash closes either pipe depending on when it exits: {io_err}"
+        );
+        insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&err, &[(&io_err.to_string(), "<closed process pipe>")]), "cannot invoke if failure is requested", @"
+        Failed to invoke 'smudge' command
+
+        Caused by:
+            0: Failed to read or write to the process
+            1: <closed process pipe>
+        ");
+
+        let mut filtered = state
+            .apply(
+                &driver,
+                &mut std::io::empty(),
+                Operation::Smudge,
+                context_from_path("fine"),
+            )?
+            .expect("filter applied");
+        let mut buf = Vec::new();
+        filtered.read_to_end(&mut buf)?;
+        assert_eq!(buf.len(), 0, "nothing was done if input is empty, but it was applied");
+        Ok(())
+    }
+
+    #[test]
+    fn process_status_abort_disables_capability() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let driver = driver_with_process();
+        let client = extract_client(state.maybe_launch_process(&driver, Operation::Clean, "does not matter".into())?);
+
+        assert!(
+            client
+                .invoke("next-smudge-aborts", &mut None.into_iter(), &mut &b""[..])?
+                .is_success()
+        );
+        let err = state
+            .apply(
+                &driver,
+                &mut std::io::empty(),
+                Operation::Smudge,
+                context_from_path("any"),
+            )
+            .err()
+            .expect("the process reports its requested abort status");
+        assert!(
+            err.classify().next().is_none(),
+            "a filter's explicit abort is not malformed protocol data"
+        );
+        insta::assert_debug_snapshot!(err, "process status abort disables capability", @r#"The invoked command 'smudge' in process indicated an error: Named("abort")"#);
+        assert!(
+            state
+                .apply(
+                    &driver,
+                    &mut std::io::empty(),
+                    Operation::Smudge,
+                    context_from_path("any")
+                )?
+                .is_none(),
+            "smudge is now disabled permanently"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_status_strange_shuts_down_process() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let driver = driver_with_process();
+        let client = extract_client(state.maybe_launch_process(&driver, Operation::Clean, "does not matter".into())?);
+
+        assert!(
+            client
+                .invoke(
+                    "next-invocation-returns-strange-status-and-smudge-fails-permanently",
+                    &mut None.into_iter(),
+                    &mut &b""[..]
+                )?
+                .is_success()
+        );
+        let err = state
+            .apply(
+                &driver,
+                &mut std::io::empty(),
+                Operation::Smudge,
+                context_from_path("any"),
+            )
+            .err()
+            .expect("the process reports its requested failure status");
+        insta::assert_debug_snapshot!(err, "process status strange shuts down process", @r#"The invoked command 'smudge' in process indicated an error: Named("send-term-signal")"#);
+        let mut filtered = state
+            .apply(&driver, &mut &b"hi\n"[..], Operation::Smudge, context_from_path("any"))?
+            .expect("the process won't fail as it got restarted");
+        let mut buf = Vec::new();
+        filtered.read_to_end(&mut buf)?;
+        assert_eq!(buf.as_bstr(), "➡hi\n", "the process works again as expected");
+        Ok(())
+    }
+
+    #[test]
+    fn smudge_and_clean_failure_is_translated_to_observable_error_for_required_drivers() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let driver = driver_no_process();
+        assert!(driver.required);
+
+        let mut filtered = state
+            .apply(
+                &driver,
+                &mut &b"hello\nthere\n"[..],
+                driver::Operation::Smudge,
+                context_from_path("do/fail"),
+            )?
+            .expect("filter present");
+        let mut buf = Vec::new();
+        let err = filtered.read_to_end(&mut buf).unwrap_err();
+        #[cfg(not(windows))]
+        insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[(env!("CARGO_BIN_EXE_gix-filter-test-arrow"), "<filter-driver>")]), "smudge and clean failure is translated to observable error for required drivers", @r#"
+        Custom {
+            kind: Other,
+            error: Message {
+                message: "Driver process \"/bin/sh\" \"-c\" \"'<filter-driver>' smudge 'do/fail'\" \"sh\" failed",
+                values: {exit_code: I64(101), exit_status: String("exit status: 101"), program: Path("/bin/sh")},
+            },
+        }
+        "#);
+        #[cfg(windows)]
+        insta::assert_debug_snapshot!(gix_testtools::redact_debug_snapshot(&(err), &[(env!("CARGO_BIN_EXE_gix-filter-test-arrow"), "<filter-driver>")]), "smudge and clean failure is translated to observable error for required drivers", @r#"
+        Custom {
+            kind: Other,
+            error: Message {
+                message: "Driver process \"<filter-driver>\" \"smudge\" \"do/fail\" failed",
+                values: {exit_code: I64(101), exit_status: String("exit code: 101"), program: Path("<filter-driver>")},
+            },
+        }
+        "#);
+
+        Ok(())
+    }
+
+    #[test]
+    fn smudge_and_clean_failure_falls_back_to_input_if_required_is_false() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let mut driver = driver_no_process();
+        driver.required = false;
+        let input = b"hello\nthere\n";
+
+        let mut filtered = state
+            .apply(
+                &driver,
+                &mut &input[..],
+                driver::Operation::Clean,
+                context_from_path("do/fail"),
+            )?
+            .expect("filter present");
+        let mut output = Vec::new();
+        filtered.read_to_end(&mut output)?;
+        assert_eq!(
+            output, input,
+            "a non-required driver failure leaves the input unchanged"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn successful_non_required_driver_can_close_stdin_early() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let mut driver = driver_no_process();
+        driver.required = false;
+        driver.clean = Some({
+            let mut command = driver_path();
+            command.push_str(" take-one");
+            command
+        });
+        let input = vec![b'a'; 1024 * 1024];
+
+        let mut filtered = state
+            .apply(
+                &driver,
+                &mut input.as_slice(),
+                driver::Operation::Clean,
+                context_from_path("ignored"),
+            )?
+            .expect("filter present");
+        let mut output = Vec::new();
+        filtered.read_to_end(&mut output)?;
+        assert_eq!(
+            output, b"a",
+            "a successful filter may intentionally consume only part of its input"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn smudge_and_clean_series() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        for mut driver in [driver_no_process(), driver_with_process()] {
+            assert!(
+                driver.required,
+                "we want errors to definitely show, and don't expect them"
+            );
+            if driver.process.is_none() {
+                // on CI on MacOS, the process seems to actually exit with non-zero status, let's see if this fixes it.
+                driver.required = false;
+            }
+
+            let input = "hello\nthere\n";
+            let mut filtered = state
+                .apply(
+                    &driver,
+                    &mut input.as_bytes(),
+                    driver::Operation::Smudge,
+                    context_from_path("some/path.txt"),
+                )?
+                .expect("filter present");
+            let mut buf = Vec::new();
+            filtered.read_to_end(&mut buf)?;
+            drop(filtered);
+            assert_eq!(
+                buf.as_bstr(),
+                "➡hello\n➡there\n",
+                "arrow applies indentation in smudge mode"
+            );
+
+            let smudge_result = buf.clone();
+            let mut filtered = state
+                .apply(
+                    &driver,
+                    &mut smudge_result.as_bytes(),
+                    driver::Operation::Clean,
+                    context_from_path("some/path.txt"),
+                )?
+                .expect("filter present");
+            buf.clear();
+            filtered.read_to_end(&mut buf)?;
+            assert_eq!(
+                buf.as_bstr(),
+                input,
+                "the clean filter reverses the smudge filter (and we call the right one)"
+            );
+        }
+        state
+            .shutdown(gix_filter::driver::shutdown::Mode::WaitForProcesses)?
+            .into_result()?;
+        Ok(())
+    }
+
+    #[test]
+    fn smudge_and_clean_delayed() -> TestResult {
+        let mut state = gix_filter::driver::State::default();
+        let driver = driver_with_process();
+        let input = "hello\nthere\n";
+        let process_key = extract_delayed_key(state.apply_delayed(
+            &driver,
+            &mut input.as_bytes(),
+            driver::Operation::Smudge,
+            Delay::Allow,
+            context_from_path("sub/a.txt"),
+        )?);
+
+        let paths = state.list_delayed_paths(&process_key)?;
+        assert_eq!(
+            paths.len(),
+            1,
+            "delayed paths have to be queried again and are available until that happens"
+        );
+        assert_eq!(paths[0], "sub/a.txt");
+
+        let mut filtered = state.fetch_delayed(&process_key, paths[0].as_ref(), driver::Operation::Smudge)?;
+        let mut buf = Vec::new();
+        filtered.read_to_end(&mut buf)?;
+        drop(filtered);
+        assert_eq!(
+            buf.as_bstr(),
+            "➡hello\n➡there\n",
+            "arrow applies indentation also in delayed mode"
+        );
+
+        let paths = state.list_delayed_paths(&process_key)?;
+        assert_eq!(paths.len(), 0, "delayed paths are consumed once fetched");
+
+        let process_key = extract_delayed_key(state.apply_delayed(
+            &driver,
+            &mut buf.as_bytes(),
+            driver::Operation::Clean,
+            Delay::Allow,
+            context_from_path("sub/b.txt"),
+        )?);
+
+        let paths = state.list_delayed_paths(&process_key)?;
+        assert_eq!(
+            paths.len(),
+            1,
+            "we can do another round of commands with the same process (at least if the implementation supports it), it's probably not done in practice"
+        );
+        assert_eq!(paths[0], "sub/b.txt");
+
+        let mut filtered = state.fetch_delayed(&process_key, paths[0].as_ref(), driver::Operation::Clean)?;
+        let mut buf = Vec::new();
+        filtered.read_to_end(&mut buf)?;
+        drop(filtered);
+        assert_eq!(
+            buf.as_bstr(),
+            input,
+            "it's possible to apply clean in delayed mode as well"
+        );
+
+        let paths = state.list_delayed_paths(&process_key)?;
+        assert_eq!(paths.len(), 0, "delayed paths are consumed once fetched");
+
+        state
+            .shutdown(gix_filter::driver::shutdown::Mode::WaitForProcesses)?
+            .into_result()?;
+        Ok(())
+    }
+
+    #[test]
+    fn delaying_without_permission_is_corruption() -> TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        let mut state = gix_filter::driver::State::default();
+        let mut driver = driver_with_process();
+        driver
+            .process
+            .as_mut()
+            .expect("process driver is configured")
+            .push_str(" force-delay");
+        let err = state
+            .apply(
+                &driver,
+                &mut std::io::empty(),
+                Operation::Smudge,
+                context_from_path("file.txt"),
+            )
+            .err()
+            .expect("the filter must not delay a request without permission");
+        assert!(err.is_corrupted(), "the filter violated the negotiated protocol");
+
+        assert_eq!(
+            err.to_string(),
+            "Filter process delayed an entry even though that was not requested",
+            "the protocol diagnostic remains unchanged"
+        );
+        state
+            .shutdown(driver::shutdown::Mode::WaitForProcesses)?
+            .into_result()?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_file_with_cat_filter_does_not_hang() -> TestResult {
+        // This test reproduces issue #2080 where using `cat` as a filter with a large file
+        // causes a deadlock. The pipe buffer is typically 64KB on Linux, so we use files
+        // larger than that to ensure the buffer fills up.
+
+        // Typical pipe buffer sizes on Unix systems
+        const PIPE_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+
+        let mut state = gix_filter::driver::State::default();
+
+        // Create a driver that uses `cat` command (which echoes input to output immediately)
+        let driver = Driver {
+            name: "cat".into(),
+            clean: Some(cat_invocation().to_owned()),
+            smudge: Some(cat_invocation().to_owned()),
+            process: None,
+            required: false,
+        };
+
+        // Test with multiple sizes to ensure robustness
+        for size in [
+            PIPE_BUFFER_SIZE,
+            2 * PIPE_BUFFER_SIZE,
+            8 * PIPE_BUFFER_SIZE,
+            16 * PIPE_BUFFER_SIZE,
+        ] {
+            let input = vec![b'a'; size];
+
+            // Apply the filter - this should not hang
+            let mut filtered = state
+                .apply(
+                    &driver,
+                    &mut input.as_slice(),
+                    driver::Operation::Smudge,
+                    context_from_path("large-file.txt"),
+                )?
+                .expect("filter present");
+
+            let mut output = Vec::new();
+            filtered.read_to_end(&mut output)?;
+
+            assert_eq!(
+                input.len(),
+                output.len(),
+                "cat should pass through all data unchanged for {size} bytes"
+            );
+            assert_eq!(input, output, "cat should not modify the data");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn large_file_with_cat_filter_early_drop() -> TestResult {
+        // Test that dropping the reader early doesn't cause issues (thread cleanup)
+        let mut state = gix_filter::driver::State::default();
+
+        let driver = Driver {
+            name: "cat".into(),
+            clean: Some(cat_invocation().to_owned()),
+            smudge: Some(cat_invocation().to_owned()),
+            process: None,
+            required: false,
+        };
+
+        let input = vec![b'x'; 256 * 1024];
+
+        // Apply the filter but only read a small amount
+        let mut filtered = state
+            .apply(
+                &driver,
+                &mut input.as_slice(),
+                driver::Operation::Clean,
+                context_from_path("early-drop.txt"),
+            )?
+            .expect("filter present");
+
+        let mut output = vec![0u8; 100];
+        filtered.read_exact(&mut output)?;
+        assert_eq!(output, vec![b'x'; 100], "should read first 100 bytes");
+
+        // Drop the reader early - the thread should still clean up properly
+        drop(filtered);
+
+        Ok(())
+    }
+
+    fn extract_delayed_key(res: Option<apply::MaybeDelayed<'_>>) -> driver::Key {
+        match res {
+            Some(apply::MaybeDelayed::Immediate(_)) | None => {
+                unreachable!("must use process that supports delaying")
+            }
+            Some(apply::MaybeDelayed::Delayed(key)) => key,
+        }
+    }
+
+    fn context_from_path(path: &str) -> apply::Context<'_, '_> {
+        apply::Context {
+            rela_path: path.into(),
+            ref_name: None,
+            treeish: None,
+            blob: None,
+        }
+    }
+
+    fn cat_invocation() -> &'static BStr {
+        if cfg!(windows) {
+            static CAT: LazyLock<Option<BString>> = LazyLock::new(|| {
+                gix_command::prepare("command -v cat | cygpath --mixed --file -")
+                    .with_shell()
+                    .spawn()
+                    .ok()?
+                    .wait_with_output()
+                    .ok()
+                    .filter(|output| output.status.success())?
+                    .stdout
+                    .strip_suffix(b"\n")
+                    .map(BStr::new)
+                    .map(gix_quote::single)
+            });
+            CAT.as_deref().map_or_else(|| b"cat.exe".into(), BStr::new)
+        } else {
+            b"cat".into()
+        }
+    }
+}
+
+fn driver_path() -> BString {
+    fn quote_driver_path(path: &str) -> BString {
+        let path = gix_path::to_unix_separators_on_windows(BStr::new(path));
+        gix_quote::single(path.as_ref())
+    }
+
+    // Cargo builds binary targets before integration tests and provides their absolute paths.
+    // Invoking Cargo recursively here would race with other nextest processes over the same artifact.
+    quote_driver_path(env!("CARGO_BIN_EXE_gix-filter-test-arrow"))
+}
